@@ -1,0 +1,264 @@
+# Reusable workflow: lint, scan, build and (optionally) publish ONE image.
+#
+# Called once per application folder by ci.yml. Everything app-specific arrives
+# as an input, so onboarding a new image costs zero edits to this file.
+#
+# Registry writes happen if and only if `publish` is true, which ci.yml only
+# ever sets for a push to master or an explicit workflow_dispatch.
+name: Build image
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Application folder name, e.g. arc-runner
+        required: true
+        type: string
+      version:
+        description: Version read from <app>/VERSION
+        required: true
+        type: string
+      image:
+        description: Fully qualified image name without a tag, e.g. docker.io/sondn98/arc-runner
+        required: true
+        type: string
+      platforms:
+        description: Comma-separated buildx platforms
+        required: true
+        type: string
+      build_args:
+        description: Newline-separated KEY=value build args (may be empty)
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: Push to the registry. Never true for pull_request runs.
+        required: false
+        type: boolean
+        default: false
+      runner:
+        description: runs-on label for the build job
+        required: false
+        type: string
+        default: ubuntu-24.04
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: ${{ inputs.app }} ${{ inputs.version }}
+    runs-on: ${{ inputs.runner }}
+
+    # Serialise per app so two merges touching the same image cannot race each
+    # other to the registry. Never cancel a publish that is already running.
+    concurrency:
+      group: image-${{ inputs.app }}-${{ github.ref }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Printed first so a failed run shows what it was building without
+      # anyone having to open the logs.
+      - name: Show build context
+        run: |
+          {
+            echo "## ${{ inputs.app }} — ${{ inputs.version }}"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Image | \`${{ inputs.image }}\` |"
+            echo "| Platforms | \`${{ inputs.platforms }}\` |"
+            echo "| Dockerfile | \`${{ inputs.app }}/Dockerfile\` |"
+            echo "| Publish | \`${{ inputs.publish }}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lint Dockerfile (hadolint)
+        id: lint
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: ${{ inputs.app }}/Dockerfile
+          # Warnings and info are surfaced as annotations but do not block.
+          failure-threshold: error
+
+      # Misconfiguration scan of the folder's Dockerfile. Report-only by
+      # decision: it flags style/hardening issues we want visible, not blocking.
+      - name: Scan Dockerfile for misconfiguration (Trivy config)
+        id: misconfig
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.app }}
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      # QEMU lets one runner build every target platform. On a native runner
+      # for the matching arch this is a no-op; cross-arch stages are emulated.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Multi-platform builds cannot be loaded into the local daemon, so for the
+      # PR vulnerability gate we build the runner's own architecture only and
+      # load that. The layer cache is shared with the full build below.
+      - name: Resolve native platform for the scan build
+        if: ${{ !inputs.publish }}
+        id: native
+        run: |
+          case "${{ runner.arch }}" in
+            ARM64) platform=linux/arm64 ;;
+            *)     platform=linux/amd64 ;;
+          esac
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "Scanning on $platform"
+
+      - name: Build image for scanning (local only, no push)
+        if: ${{ !inputs.publish }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.app }}
+          file: ${{ inputs.app }}/Dockerfile
+          platforms: ${{ steps.native.outputs.platform }}
+          build-args: ${{ inputs.build_args }}
+          load: true
+          push: false
+          tags: local-scan/${{ inputs.app }}:${{ inputs.version }}
+          cache-from: type=gha,scope=${{ inputs.app }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.app }}
+
+      # Informational pass: everything HIGH and above, including unfixed, so the
+      # full picture lands in the job summary.
+      - name: Vulnerability report (Trivy, informational)
+        if: ${{ !inputs.publish }}
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: local-scan/${{ inputs.app }}:${{ inputs.version }}
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          format: table
+          output: trivy-report.txt
+
+      - name: Publish vulnerability report to the summary
+        if: ${{ !inputs.publish && always() }}
+        continue-on-error: true
+        run: |
+          {
+            echo "<details><summary>Trivy report — ${{ inputs.app }} (HIGH + CRITICAL, informational)</summary>"
+            echo ""
+            echo '```'
+            if [ -s trivy-report.txt ]; then cat trivy-report.txt; else echo "No findings reported."; fi
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The actual gate: CRITICAL only, and only vulnerabilities that have a fix
+      # available - we will not block a merge on something nobody can remediate.
+      - name: Vulnerability gate (Trivy, CRITICAL with a fix)
+        if: ${{ !inputs.publish }}
+        id: vulnscan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: local-scan/${{ inputs.app }}:${{ inputs.version }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Log in to Docker Hub
+        if: ${{ inputs.publish }}
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Tag policy:
+      #   <version>     always
+      #   sha-<short>   always, for tracing an image back to a commit
+      #   latest        stable releases only - never for a pre-release such as
+      #                 3.2.3-rc1 (detected by the '-' in the version).
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ inputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ !contains(inputs.version, '-') }}
+          labels: |
+            org.opencontainers.image.title=${{ inputs.app }}
+            org.opencontainers.image.version=${{ inputs.version }}
+
+      # The real build: every target platform. On a PR this proves the image
+      # still builds everywhere; on master it is what gets pushed.
+      # Attestations only make sense against a registry, so they follow publish.
+      - name: Build all target platforms
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.app }}
+          file: ${{ inputs.app }}/Dockerfile
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build_args }}
+          push: ${{ inputs.publish }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: ${{ inputs.publish && 'mode=max' || 'false' }}
+          sbom: ${{ inputs.publish }}
+          cache-from: type=gha,scope=${{ inputs.app }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.app }}
+
+      - name: Record published tags
+        if: ${{ inputs.publish && success() }}
+        run: |
+          {
+            echo "**Pushed tags**"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One markdown row per app, collected by the report job in ci.yml so the
+      # PR comment can show pass/fail per app without opening any logs.
+      - name: Write result row
+        if: ${{ always() }}
+        run: |
+          mkdir -p .ci-report
+          icon() { case "$1" in success) echo "✅";; failure) echo "❌";; skipped|"") echo "—";; *) echo "⚠️";; esac; }
+          {
+            printf '| `%s` | `%s` | %s | %s | %s | %s |\n' \
+              "${{ inputs.app }}" \
+              "${{ inputs.version }}" \
+              "$(icon "${{ steps.lint.outcome }}")" \
+              "$(icon "${{ steps.misconfig.outcome }}")" \
+              "$(icon "${{ steps.vulnscan.outcome }}")" \
+              "$(icon "${{ steps.build.outcome }}")"
+          } > ".ci-report/build-${{ inputs.app }}.md"
+
+      - name: Upload result row
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-result-${{ inputs.app }}
+          path: .ci-report/build-${{ inputs.app }}.md
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Explain the failure
+        if: ${{ failure() }}
+        run: |
+          echo "::error::${{ inputs.app }} ${{ inputs.version }} failed. lint=${{ steps.lint.outcome }} misconfig=${{ steps.misconfig.outcome }} vuln-gate=${{ steps.vulnscan.outcome }} build=${{ steps.build.outcome }} (platforms: ${{ inputs.platforms }})"

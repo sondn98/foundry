@@ -1,0 +1,269 @@
+# Image CI/CD for every application folder in this repository.
+#
+# Triggers:
+#   pull_request -> master  validate + build, NEVER publishes
+#   push         -> master  build + publish to Docker Hub, but only for folders
+#                           whose VERSION changed in the push
+#   workflow_dispatch       manual escape hatch (publishing is opt-in)
+#
+# Applications are discovered dynamically: any top-level folder tracked by git
+# that holds a Dockerfile and a VERSION is picked up. Adding an image requires
+# no change to this file. See docs/ci.md.
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Application folder to run (leave empty for all)"
+        required: false
+        type: string
+      publish:
+        description: "Push the built image(s) to Docker Hub"
+        required: false
+        type: boolean
+        default: false
+
+# Least privilege by default; individual jobs widen this only where needed.
+permissions:
+  contents: read
+
+concurrency:
+  # One run per PR (superseded runs are cancelled) or per branch (queued, so a
+  # publish is never interrupted). Per-app serialisation lives in build-image.yml.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Registry and namespace for every image in this repo: docker.io/sondn98/<folder>.
+  # A folder can override just the repository part via its ci.yaml `image:` key.
+  REGISTRY: docker.io
+  NAMESPACE: sondn98
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Which application folders does this run touch?
+  # ---------------------------------------------------------------------------
+  discover:
+    name: Discover apps
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      count: ${{ steps.discover.outputs.count }}
+      publish: ${{ steps.discover.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so we can diff against the base branch / previous push.
+          fetch-depth: 0
+
+      - name: Resolve diff base
+        id: base
+        run: |
+          # The empty-tree hash makes "everything is new", used when there is no
+          # usable predecessor (first commit, force push, fresh branch).
+          EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+          case "${{ github.event_name }}" in
+            pull_request)
+              # Three-dot semantics: only what the PR itself changed.
+              base=$(git merge-base "${{ github.event.pull_request.base.sha }}" HEAD)
+              ;;
+            push)
+              base="${{ github.event.before }}"
+              if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+                base=$(git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+              fi
+              ;;
+            *)
+              base=""
+              ;;
+          esac
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "Diffing against: ${base:-<n/a, manual run>}"
+
+      - name: Discover application folders
+        id: discover
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          INPUT_APP: ${{ inputs.app }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          REGISTRY: ${{ env.REGISTRY }}
+          NAMESPACE: ${{ env.NAMESPACE }}
+        run: bash .github/scripts/discover.sh
+
+  # ---------------------------------------------------------------------------
+  # PR gate: semver, version increase, and the VERSION <-> CHANGES.md rule.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate versions and changelogs
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate changed application folders
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          REPORT: .ci-report/validation.md
+        run: |
+          # Compare against the merge base so unrelated commits landing on
+          # master while the PR is open do not count as "changed by this PR".
+          BASE_SHA=$(git merge-base "$BASE_SHA" HEAD) \
+            bash .github/scripts/validate.sh
+
+      - name: Upload validation report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-validation
+          path: .ci-report/validation.md
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # PR gate: accidentally committed secrets, repo-wide (not just app folders).
+  # ---------------------------------------------------------------------------
+  secret_scan:
+    name: Secret scan
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # gitleaks-action is free for personal accounts and public repositories.
+      # If this repo ever moves under an organisation it will additionally
+      # require a GITLEAKS_LICENSE secret.
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # One reusable-workflow call per application folder.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    needs: [discover, validate]
+    # Runs when there is something to build and validation did not fail.
+    # `validate` is skipped outside pull requests, which must not block this.
+    if: >-
+      ${{
+        !cancelled()
+        && needs.discover.outputs.count != '0'
+        && (needs.validate.result == 'success' || needs.validate.result == 'skipped')
+      }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.discover.outputs.matrix) }}
+    uses: ./.github/workflows/build-image.yml
+    with:
+      app: ${{ matrix.target.app }}
+      version: ${{ matrix.target.version }}
+      image: ${{ matrix.target.image }}
+      platforms: ${{ matrix.target.platforms }}
+      build_args: ${{ matrix.target.build_args }}
+      publish: ${{ needs.discover.outputs.publish == 'true' }}
+      runner: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-24.04' }}
+    # Passes DOCKERHUB_USERNAME / DOCKERHUB_TOKEN through by name only.
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Roll everything up into one sticky PR comment.
+  # ---------------------------------------------------------------------------
+  report:
+    name: Report
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [discover, validate, secret_scan, build]
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download reports
+        # Never let a missing artifact (e.g. a cancelled job) stop us from
+        # posting the comment - the assembly step degrades gracefully.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: reports
+          pattern: ci-*
+          merge-multiple: true
+
+      - name: Assemble comment
+        id: body
+        run: |
+          icon() {
+            case "$1" in
+              success) echo "✅ pass" ;;
+              failure) echo "❌ fail" ;;
+              cancelled) echo "🚫 cancelled" ;;
+              skipped) echo "— skipped" ;;
+              *) echo "⚠️ $1" ;;
+            esac
+          }
+
+          {
+            echo "### CI — image pipeline"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Version & changelog validation | $(icon "${{ needs.validate.result }}") |"
+            echo "| Secret scan | $(icon "${{ needs.secret_scan.result }}") |"
+            echo "| Build & image scan | $(icon "${{ needs.build.result }}") |"
+            echo ""
+
+            if [ "${{ needs.discover.outputs.count }}" = "0" ]; then
+              echo "No application folders changed in this pull request, so nothing was built."
+            else
+              if [ -s reports/validation.md ]; then
+                echo "#### Validation"
+                echo ""
+                cat reports/validation.md
+                echo ""
+              fi
+
+              echo "#### Build"
+              echo ""
+              echo "| App | Version | Dockerfile lint | Misconfig | Vuln gate | Build |"
+              echo "| --- | --- | --- | --- | --- | --- |"
+              if ls reports/build-*.md >/dev/null 2>&1; then
+                cat reports/build-*.md
+              else
+                echo "| _no build results_ | | | | | |"
+              fi
+              echo ""
+              echo "<sub>Vuln gate = Trivy, CRITICAL with a fix available. Misconfig is informational. Nothing was pushed to the registry — pull requests never publish.</sub>"
+            fi
+
+            echo ""
+            echo "<sub>[Full logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})</sub>"
+          } > comment.md
+
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post or update the PR comment
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: image-ci
+          path: comment.md
