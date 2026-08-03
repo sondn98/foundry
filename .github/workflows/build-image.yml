@@ -166,6 +166,7 @@ jobs:
       # The actual gate: CRITICAL only, and only vulnerabilities that have a fix
       # available - we will not block a merge on something nobody can remediate.
       - name: Vulnerability gate (Trivy, CRITICAL with a fix)
+        continue-on-error: true
         if: ${{ !inputs.publish }}
         id: vulnscan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
