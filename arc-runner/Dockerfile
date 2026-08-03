@@ -4,7 +4,7 @@
 # bakes in helm, kubectl, helmfile and the helm-diff plugin that `helmfile
 # apply` depends on. Versions are pinned and overridable via --build-arg.
 #
-# Build and push (the lab nodes are arm64 Raspberry Pis):
+# Build and push (the lab nodes are arm64 Raspberry Pi machines):
 #   docker buildx build --platform linux/arm64 \
 #     --tag ghcr.io/sondn98/fabricator-arc-runner:2.336.0 \
 #     --push docker/arc-runner

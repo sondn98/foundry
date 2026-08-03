@@ -39,10 +39,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Registry and namespace for every image in this repo: docker.io/sondn98/<folder>.
+  # Registry and namespace for every image in this repo: docker.io/sondn1/<folder>.
   # A folder can override just the repository part via its ci.yaml `image:` key.
   REGISTRY: docker.io
-  NAMESPACE: sondn98
+  NAMESPACE: sondn1
 
 jobs:
   # ---------------------------------------------------------------------------
