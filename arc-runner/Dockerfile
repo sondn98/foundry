@@ -22,6 +22,7 @@ ARG HELM_VERSION=v3.21.3
 ARG KUBECTL_VERSION=v1.34.10
 ARG HELMFILE_VERSION=1.7.1
 ARG HELM_DIFF_VERSION=3.15.10
+ARG KUSTOMIZE_VERSION=v5.8.1
 # Set automatically by BuildKit; the default keeps a plain `docker build` working.
 ARG TARGETARCH=arm64
 
@@ -40,6 +41,11 @@ RUN curl -fsSL "https://github.com/helmfile/helmfile/releases/download/v${HELMFI
     && tar -xzf /tmp/helmfile.tar.gz -C /tmp helmfile \
     && install -m 0755 /tmp/helmfile /usr/local/bin/helmfile \
     && rm -f /tmp/helmfile.tar.gz /tmp/helmfile
+
+RUN curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_${TARGETARCH}.tar.gz" -o /tmp/kustomize.tar.gz \ 
+    && tar -xzf /tmp/kustomize.tar.gz -C /tmp kustomize \
+    && install -m 0755 /tmp/kustomize /usr/local/bin/kustomize \
+    && rm -f /tmp/kustomize.tar.gz /tmp/kustomize
 
 # helm-diff is installed as - and owned by - the `runner` user the runner
 # process executes as, so HimageELM_PLUGINS resolves it when helmfile shells out.

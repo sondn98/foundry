@@ -50,7 +50,7 @@ jobs:
   # ---------------------------------------------------------------------------
   discover:
     name: Discover apps
-    runs-on: ${{ vars.CI_RUNNER_LABEL || 'arc-foundry' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -106,7 +106,7 @@ jobs:
   validate:
     name: Validate versions and changelogs
     if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ${{ vars.CI_RUNNER_LABEL || 'arc-foundry' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -141,7 +141,7 @@ jobs:
   secret_scan:
     name: Secret scan
     if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ${{ vars.CI_RUNNER_LABEL || 'arc-foundry' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -184,7 +184,7 @@ jobs:
       platforms: ${{ matrix.target.platforms }}
       build_args: ${{ matrix.target.build_args }}
       publish: ${{ needs.discover.outputs.publish == 'true' }}
-      runner: ${{ vars.CI_RUNNER_LABEL || 'arc-foundry' }}
+      runner: ubuntu-latest
     # Passes DOCKERHUB_USERNAME / DOCKERHUB_TOKEN through by name only.
     secrets: inherit
 
@@ -195,7 +195,7 @@ jobs:
     name: Report
     if: ${{ always() && github.event_name == 'pull_request' }}
     needs: [discover, validate, secret_scan, build]
-    runs-on: ${{ vars.CI_RUNNER_LABEL || 'arc-foundry' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
